@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         学习通严格顺序连续播放 v22.3
+// @name         学习通严格顺序连续播放 v22.4
 // @namespace    chaoxing-sequential-v22
-// @version      22.3
+// @version      22.4
 // @description  自动静音、鼠标移出不暂停、后台保活、严格顺序自动下一课，并在视频判断题出现时响铃和闪烁标签页
 // @match        https://*.chaoxing.com/*
 // @run-at       document-start
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const TAG = '[学习通 v22.3]';
+    const TAG = '[学习通 v22.4]';
 
     const FRAME_ID =
         'cx22_' +
@@ -182,6 +182,79 @@
 
     let localQuizWasActive =
         false;
+
+    // 每个 iframe 都维护同一把题目锁，由顶层页面广播状态。
+    let quizIsActive = false;
+    let quizRecoveryPending = false;
+    let quizResumeTimer = null;
+    let quizLockGeneration = 0;
+
+    function resumeAfterQuiz() {
+        if (quizIsActive || detectVideoQuiz()) {
+            return;
+        }
+
+        const candidates = Array.from(document.querySelectorAll('video'))
+            .filter(video =>
+                video.isConnected &&
+                isVisible(video) &&
+                !video.ended &&
+                Number.isFinite(Number(video.duration)) &&
+                Number(video.duration) > 0
+            );
+
+        // 优先恢复当前课程的播放器，避免唤醒旧课或隐藏播放器。
+        const video = candidates.find(candidate =>
+            activeLessonKey &&
+            candidate.dataset.cx22LessonKey === activeLessonKey
+        ) || candidates[0];
+
+        if (!video) {
+            return;
+        }
+
+        muteVideo(video);
+        bindVideo(video);
+
+        if (video.paused) {
+            try {
+                const result = video.play();
+                if (result && typeof result.catch === 'function') {
+                    result.catch(() => {});
+                }
+                log('判断题消失后，尝试恢复当前视频');
+            } catch (e) {}
+        }
+    }
+
+    function setQuizLock(active) {
+        const next = !!active;
+        if (quizIsActive === next) {
+            return;
+        }
+
+        quizIsActive = next;
+        quizLockGeneration += 1;
+        clearTimeout(quizResumeTimer);
+        quizResumeTimer = null;
+
+        if (next) {
+            quizRecoveryPending = false;
+            log('判断题锁定：暂停自动恢复');
+            return;
+        }
+
+        quizRecoveryPending = true;
+        const generation = quizLockGeneration;
+        quizResumeTimer = setTimeout(() => {
+            quizResumeTimer = null;
+            if (generation === quizLockGeneration) {
+                quizRecoveryPending = false;
+                resumeAfterQuiz();
+            }
+        }, 700);
+        log('判断题锁解除：约 700ms 后恢复当前视频');
+    }
 
 
     function quizElementVisible(
@@ -545,6 +618,14 @@
             quizActiveFrames.size >
             0;
 
+        if (hadAny !== hasAny) {
+            setQuizLock(hasAny);
+            coordinatorBroadcast({
+                type: 'CX22_QUIZ_LOCK',
+                active: hasAny
+            });
+        }
+
 
         /*
          * 从“没有题”变成“有题”
@@ -640,6 +721,9 @@
             active
         ) {
 
+            // 本帧先上锁，避免等待跨 iframe 消息期间自动播放。
+            setQuizLock(true);
+
             sendQuizState(
                 true
             );
@@ -658,7 +742,7 @@
 
 
         localQuizWasActive =
-            active;
+            !!active;
     }
 
 
@@ -717,12 +801,13 @@
             setInterval(
                 () => {
 
+                    // 后台计时器可能被浏览器降频，不能据此误判题目消失。
+                    if (getRealHidden()) {
+                        return;
+                    }
+
                     const now =
                         Date.now();
-
-
-                    let changed =
-                        false;
 
 
                     for (
@@ -736,28 +821,11 @@
                         if (
                             now -
                                 lastSeen >
-                            3500
+                            10000
                         ) {
 
-                            quizActiveFrames
-                                .delete(
-                                    frameId
-                                );
-
-
-                            changed =
-                                true;
+                            coordinatorSetQuizState(frameId, false);
                         }
-                    }
-
-
-                    if (
-                        changed &&
-                        quizActiveFrames.size ===
-                            0
-                    ) {
-
-                        stopQuizTabFlash();
                     }
 
                 },
@@ -954,6 +1022,9 @@
     ) {
 
         if (
+            quizIsActive ||
+            quizRecoveryPending ||
+            detectVideoQuiz() ||
             !backgroundMode ||
             !backgroundVideos.has(
                 video
@@ -1036,6 +1107,9 @@
     function resumeBackgroundVideos() {
 
         if (
+            quizIsActive ||
+            quizRecoveryPending ||
+            detectVideoQuiz() ||
             !backgroundMode
         ) {
 
@@ -1923,6 +1997,11 @@
 
     function tryPlayLocal() {
 
+        // 包括播放器中央按钮在内的所有自动恢复都受题目锁约束。
+        if (quizIsActive || quizRecoveryPending || detectVideoQuiz()) {
+            return;
+        }
+
         const videos =
             Array.from(
                 document
@@ -2209,6 +2288,9 @@
                         video.duration
                     );
 
+                const nativeEnded =
+                    video.ended === true;
+
 
                 log(
                     '收到 ended',
@@ -2227,7 +2309,9 @@
 
                         maxTime,
 
-                        played
+                        played,
+
+                        nativeEnded
                     }
                 );
 
@@ -2241,23 +2325,14 @@
                 }
 
 
-                if (
-                    !Number.isFinite(
-                        duration
-                    ) ||
-                    duration <=
-                        0
-                ) {
+                const finishedByTime =
+                    Number.isFinite(duration) &&
+                    duration > 0 &&
+                    (current >= duration - 5 ||
+                     maxTime >= duration - 5);
 
-                    return;
-                }
-
-
-                const finished =
-                    current >=
-                        duration - 5 ||
-                    maxTime >=
-                        duration - 5;
+                // 原生 ended 优先；时间进度只作为兜底。
+                const finished = nativeEnded || finishedByTime;
 
 
                 if (
@@ -2265,7 +2340,7 @@
                 ) {
 
                     log(
-                        '忽略：还没有真正播放到结尾'
+                        '忽略：ended 异常且播放进度没有到结尾'
                     );
 
 
@@ -2526,6 +2601,8 @@
         data
     ) {
 
+        const firstReport = !registry.has(data.frameId);
+
         registry.set(
             data.frameId,
             {
@@ -2567,6 +2644,15 @@
 
 
         coordinatorPrune();
+
+        if (firstReport && source && source !== window) {
+            try {
+                source.postMessage({
+                    type: 'CX22_QUIZ_LOCK',
+                    active: quizActiveFrames.size > 0
+                }, '*');
+            } catch (e) {}
+        }
 
 
         const current =
@@ -3334,6 +3420,14 @@
             const data =
                 event.data;
 
+            // 只接受顶层协调器发来的全局题目锁。
+            if (data.type === 'CX22_QUIZ_LOCK') {
+                if (event.source === window.top) {
+                    setQuizLock(!!data.active);
+                }
+                return;
+            }
+
 
             // ----------------------------------------------------
             // 判断题状态
@@ -3565,7 +3659,7 @@
     function start() {
 
         log(
-            'v22.3 启动',
+            'v22.4 启动',
 
             window ===
                 window.top
